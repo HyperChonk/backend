@@ -1,0 +1,96 @@
+# Development override for docker-compose.yml
+# Use this for hot reloading and source code mounting during development
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+    # API Service with development overrides
+    api:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: development # Use development stage with devDependencies
+        volumes:
+            # Mount source code for hot reloading
+            - .:/app
+            # Preserve node_modules from container (has all dependencies)
+            - /app/node_modules
+            # DON'T preserve /app/dist - we want to run source files directly
+        environment:
+            # Override for development mode
+            NODE_ENV: development
+            LOG_LEVEL: debug
+            # Enable file watching for hot reload
+            CHOKIDAR_USEPOLLING: true
+            CHOKIDAR_INTERVAL: 1000
+            # Bun-specific environment variables
+            BUN_ENV: development
+            # Enable verbose logging to debug hot reload
+            BUN_LOG_LEVEL: debug
+        # File watching options (uncomment one that works best):
+        # Option 1: Bun with polling (recommended)
+        command: ['bun', '--hot', '--watch', 'run', 'apps/main.ts']
+        # Option 2: Nodemon with Docker-optimized settings (fallback)
+        # command: ['bun', 'run', 'dev:docker']
+        # Option 3: Pure nodemon (if bun hot reload fails)
+        # command: ['nodemon', '--watch', 'apps', '--watch', 'modules', '--watch', 'config', '--ext', 'ts', '--delay', '2', '--exec', 'bun run apps/main.ts']
+        healthcheck:
+            # Longer timeout for development builds
+            start_period: 120s
+
+    # Worker Service with development overrides
+    worker:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: development
+        volumes:
+            - .:/app
+            - /app/node_modules
+            # No /app/dist volume - run source files directly
+        environment:
+            NODE_ENV: development
+            LOG_LEVEL: debug
+            # Enable file watching for hot reload
+            CHOKIDAR_USEPOLLING: true
+            CHOKIDAR_INTERVAL: 1000
+            BUN_ENV: development
+            BUN_LOG_LEVEL: debug
+        # Use polling-based file watching for worker
+        command: ['bun', '--hot', '--watch', 'run', 'apps/main.ts']
+        # Remove healthcheck for development - process monitoring is enough
+        healthcheck:
+            disable: true
+
+    # Scheduler Service with development overrides
+    scheduler:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: development
+        volumes:
+            - .:/app
+            - /app/node_modules
+            # No /app/dist volume - run source files directly
+        environment:
+            NODE_ENV: development
+            LOG_LEVEL: debug
+            # Enable file watching for hot reload
+            CHOKIDAR_USEPOLLING: true
+            CHOKIDAR_INTERVAL: 1000
+            BUN_ENV: development
+            BUN_LOG_LEVEL: debug
+        # Use polling-based file watching for scheduler
+        command: ['bun', '--hot', '--watch', 'run', 'apps/main.ts']
+        # Remove healthcheck for development - process monitoring is enough
+        healthcheck:
+            disable: true
+
+    # LocalStack with debug mode for development
+    localstack:
+        environment:
+            - DEBUG=1
+            - DEVELOP=1
+            - LS_LOG=trace # More verbose logging for development
+        ports:
+            # Only expose main LocalStack port, bound to localhost to avoid conflicts
+            - '127.0.0.1:4566:4566' # Main LocalStack port

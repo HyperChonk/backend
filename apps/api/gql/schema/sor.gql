@@ -1,0 +1,321 @@
+extend type Query {
+    """
+    Get swap quote from the SOR v2 for the V2 vault
+    """
+    sorGetSwapPaths(
+        """
+        The Chain to query
+        """
+        chain: GqlChain!
+        """
+        Token address of the tokenIn
+        """
+        tokenIn: String!
+        """
+        Token address of the tokenOut
+        """
+        tokenOut: String!
+        """
+        SwapType either exact_in or exact_out (also givenIn or givenOut)
+        """
+        swapType: GqlSorSwapType!
+        """
+        The amount to swap, in human form.
+        """
+        swapAmount: AmountHumanReadable! #expected in human readable form
+        """
+        Whether to run queryBatchSwap to update the return amount with most up-to-date on-chain values, default: false
+        """
+        queryBatchSwap: Boolean @deprecated(reason: "Use Balancer SDK to query on-chain amounts from SOR response")
+        """
+        Which protocol version to use (currently 2 and 3). If none provided, will chose the better return from any version
+        """
+        useProtocolVersion: Int
+        """
+        Whether it should consider pools that have hooks. Default is false if not provided.
+        """
+        considerPoolsWithHooks: Boolean
+        """
+        Use specified poolIds only
+        """
+        poolIds: [String!]
+        """
+        Input data to create and return transaction data. If this config is given, call data is added to the response.
+        """
+        callDataInput: GqlSwapCallDataInput
+            @deprecated(reason: "Use Balancer SDK to build swap callData from SOR response")
+    ): GqlSorGetSwapPaths!
+}
+
+"""
+The swap paths for a swap
+"""
+type GqlSorGetSwapPaths {
+    """
+    The version of the vault these paths are from
+    """
+    vaultVersion: Int! @deprecated(reason: "Use protocolVersion instead")
+
+    """
+    The version of the protocol these paths are from
+    """
+    protocolVersion: Int!
+    """
+    The token address of the tokenIn provided
+    """
+    tokenIn: String!
+    """
+    The token address of the tokenOut provided
+    """
+    tokenOut: String!
+    """
+    The swapType that was provided, exact_in vs exact_out (givenIn vs givenOut)
+    """
+    swapType: GqlSorSwapType!
+    """
+    Swaps as needed for the vault swap input to execute the swap
+    """
+    swaps: [GqlSorSwap!]! #used by cowswap
+    """
+    All token addresses (or assets) as needed for the vault swap input to execute the swap
+    """
+    tokenAddresses: [String!]! #used by cowswap
+    """
+    The found paths as needed as input for the b-sdk to execute the swap
+    """
+    paths: [GqlSorPath!]! #used by b-sdk
+    """
+    The amount of tokenIn in human form
+    """
+    tokenInAmount: AmountHumanReadable!
+    """
+    The amount of tokenOut in human form
+    """
+    tokenOutAmount: AmountHumanReadable!
+    """
+    The swap amount in human form. Swap amount is either tokenInAmount (if swapType is exactIn) or tokenOutAmount (if swapType is exactOut)
+    """
+    swapAmount: AmountHumanReadable!
+    """
+    The swap amount in a raw form
+    """
+    swapAmountRaw: BigDecimal!
+    """
+    The return amount in human form. Return amount is either tokenOutAmount (if swapType is exactIn) or tokenInAmount (if swapType is exactOut)
+    """
+    returnAmount: AmountHumanReadable!
+    """
+    The return amount in a raw form
+    """
+    returnAmountRaw: BigDecimal!
+    """
+    The price of tokenOut in tokenIn.
+    """
+    effectivePrice: AmountHumanReadable!
+    """
+    The price of tokenIn in tokenOut.
+    """
+    effectivePriceReversed: AmountHumanReadable!
+    """
+    The swap routes including pool information. Used to display by the UI
+    """
+    routes: [GqlSorSwapRoute!]!
+    """
+    Price impact of the path
+    """
+    priceImpact: GqlPriceImpact!
+    """
+    Transaction data that can be posted to an RPC to execute the swap.
+    """
+    callData: GqlSorCallData @deprecated(reason: "Use Balancer SDK to build swap callData from SOR response")
+}
+
+"""
+A path of a swap. A swap can have multiple paths. Used as input to execute the swap via b-sdk
+"""
+type GqlSorPath {
+    """
+    Vault version of this path.
+    """
+    vaultVersion: Int! @deprecated(reason: "Use protocolVersion instead")
+
+    """
+    The version of the protocol these paths are from
+    """
+    protocolVersion: Int!
+    """
+    A sorted list of pool ids that are used in this path
+    """
+    pools: [String!]!
+    """
+    A sorted list of booleans that indicate if the respective pool is a buffer
+    """
+    isBuffer: [Boolean!]!
+    """
+    A sorted list of tokens that are ussed in this path
+    """
+    tokens: [Token!]!
+    """
+    Output amount of this path in scaled form
+    """
+    outputAmountRaw: String!
+    """
+    Input amount of this path in scaled form
+    """
+    inputAmountRaw: String!
+}
+
+"""
+Returns the price impact of the path. If there is an error in the price impact calculation, priceImpact will be undefined but the error string is populated.
+"""
+type GqlPriceImpact {
+    """
+    Price impact in percent 0.01 -> 0.01%; undefined if an error happened.
+    """
+    priceImpact: AmountHumanReadable
+    """
+    If priceImpact cant be calculated and is returned as undefined, the error string will be populated.
+    """
+    error: String
+}
+
+type Token {
+    address: String!
+    decimals: Int!
+}
+
+enum GqlSorSwapType {
+    EXACT_IN
+    EXACT_OUT
+}
+
+type GqlSorCallData {
+    """
+    The call data that needs to be sent to the RPC
+    """
+    callData: String!
+    """
+    The target contract to send the call data to
+    """
+    to: String!
+    """
+    Value in ETH that needs to be sent for native swaps
+    """
+    value: BigDecimal!
+    """
+    Minimum amount received for exact in orders
+    """
+    minAmountOutRaw: String
+    """
+    Maximum amount to be sent for exact out orders
+    """
+    maxAmountInRaw: String
+}
+
+"""
+Inputs for the call data to create the swap transaction. If this input is given, call data is added to the response.
+"""
+input GqlSwapCallDataInput {
+    """
+    The max slippage in percent 0.01 -> 0.01%
+    """
+    slippagePercentage: String!
+    """
+    How long the swap should be valid, provide a timestamp. "999999999999999999" for infinite. Default: infinite
+    """
+    deadline: Int
+    """
+    Who sends the input amount.
+    """
+    sender: String!
+    """
+    Who receives the output amount.
+    """
+    receiver: String!
+}
+
+"""
+A single swap step as used for input to the vault to execute a swap
+"""
+type GqlSorSwap {
+    """
+    Pool id used in this swap step
+    """
+    poolId: String!
+    """
+    Index of the asset used in the tokenAddress array.
+    """
+    assetInIndex: Int!
+    """
+    Index of the asset used in the tokenAddress array.
+    """
+    assetOutIndex: Int!
+    """
+    Amount to be swapped in this step. 0 for chained swap.
+    """
+    amount: String!
+    """
+    UserData used in this swap, generally uses defaults.
+    """
+    userData: String!
+}
+
+"""
+The swap routes including pool information. Used to display by the UI
+"""
+type GqlSorSwapRoute {
+    """
+    Address of the tokenIn
+    """
+    tokenIn: String!
+    """
+    Amount of the tokenIn in human form
+    """
+    tokenInAmount: AmountHumanReadable!
+    """
+    Address of the tokenOut
+    """
+    tokenOut: String!
+    """
+    Amount of the tokenOut in human form
+    """
+    tokenOutAmount: AmountHumanReadable!
+    """
+    Share of this route of the total swap
+    """
+    share: Float!
+    """
+    The hops this route takes
+    """
+    hops: [GqlSorSwapRouteHop!]!
+}
+
+"""
+A hop of a route. A route can have many hops meaning it traverses more than one pool.
+"""
+type GqlSorSwapRouteHop {
+    """
+    Address of the tokenIn
+    """
+    tokenIn: String!
+    """
+    Amount of the tokenIn in human form
+    """
+    tokenInAmount: AmountHumanReadable!
+    """
+    Address of the tokenOut
+    """
+    tokenOut: String!
+    """
+    Amount of the tokenOut in human form
+    """
+    tokenOutAmount: AmountHumanReadable!
+    """
+    The pool id of this hop.
+    """
+    poolId: String!
+    """
+    The pool entity of this hop.
+    """
+    pool: GqlPoolMinimal!
+}

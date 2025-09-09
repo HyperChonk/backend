@@ -1,0 +1,87 @@
+fragment VaultPool on Pool {
+    id
+    isPaused
+    isInRecoveryMode
+    swapFee
+    address
+    name
+    symbol
+    totalShares
+    pauseWindowEndTime
+    pauseManager
+    swapFeeManager
+    poolCreator
+    blockNumber
+    blockTimestamp
+    holdersCount
+    transactionHash
+    tokens {
+        id
+        address
+        index
+        name
+        symbol
+        decimals
+        balance
+        totalProtocolSwapFee
+        totalProtocolYieldFee
+        paysYieldFees
+        nestedPool {
+            id
+            tokens {
+                address
+                nestedPool {
+                    id
+                }
+            }
+        }
+        scalingFactor
+    }
+    rateProviders {
+        address
+        token {
+            address
+        }
+    }
+    hookConfig {
+        hook {
+            address
+        }
+        enableHookAdjustedAmounts
+        shouldCallAfterSwap
+        shouldCallBeforeSwap
+        shouldCallAfterInitialize
+        shouldCallBeforeInitialize
+        shouldCallAfterAddLiquidity
+        shouldCallBeforeAddLiquidity
+        shouldCallAfterRemoveLiquidity
+        shouldCallBeforeRemoveLiquidity
+        shouldCallComputeDynamicSwapFee
+    }
+    liquidityManagement {
+        disableUnbalancedLiquidity
+        enableAddLiquidityCustom
+        enableDonation
+        enableRemoveLiquidityCustom
+    }
+}
+
+query Pools(
+    $skip: Int
+    $first: Int
+    $orderBy: Pool_orderBy
+    $orderDirection: OrderDirection
+    $where: Pool_filter
+    $block: Block_height
+) {
+    pools(
+        skip: $skip
+        first: $first
+        orderBy: $orderBy
+        orderDirection: $orderDirection
+        where: $where
+        block: $block
+    ) {
+        ...VaultPool
+    }
+}

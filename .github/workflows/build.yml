@@ -1,0 +1,363 @@
+name: Build Docker Image
+
+# Global environment configuration
+env:
+    AWS_REGION: us-east-1
+    ECR_REPOSITORY: balancer-api
+    CDK_DISABLE_NOTICES: true
+
+on:
+    push:
+        branches: [develop]
+    workflow_dispatch:
+        inputs:
+            force_rebuild:
+                description: 'Force rebuild even if no changes'
+                required: false
+                default: false
+                type: boolean
+
+jobs:
+    build:
+        name: Build Docker Image
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+
+        permissions:
+            id-token: write
+            contents: read
+            packages: write
+
+        outputs:
+            image-tag: ${{ steps.meta.outputs.image-tag }}
+            primary-tag: ${{ steps.meta.outputs.primary-tag }}
+            version-tag: ${{ steps.meta.outputs.version-tag }}
+            build-tag: ${{ steps.meta.outputs.build-tag }}
+            repository: ${{ steps.meta.outputs.repository }}
+
+        steps:
+            - name: Checkout Code
+              uses: actions/checkout@v4
+
+            - name: Configure AWS Credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+                  role-session-name: GitHubActions-Build-Docker-Image
+                  aws-region: us-east-1
+
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@v2
+
+            - name: Setup Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Generate Image Metadata
+              id: meta
+              run: |
+                  # Extract version from package.json
+                  VERSION=$(jq -r '.version' package.json)
+                  COMMIT_SHA=$(git rev-parse --short HEAD)
+                  BUILD_NUMBER=${{ github.run_number }}
+
+                  # Create immutable tags
+                  PRIMARY_TAG="${VERSION}-${COMMIT_SHA}"
+                  BUILD_TAG="${VERSION}-build.${BUILD_NUMBER}"
+                  VERSION_TAG="${VERSION}"
+
+                  # Store outputs
+                  echo "version=$VERSION" >> $GITHUB_OUTPUT
+                  echo "commit-sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+                  echo "build-number=$BUILD_NUMBER" >> $GITHUB_OUTPUT
+                  echo "primary-tag=$PRIMARY_TAG" >> $GITHUB_OUTPUT
+                  echo "build-tag=$BUILD_TAG" >> $GITHUB_OUTPUT
+                  echo "version-tag=$VERSION_TAG" >> $GITHUB_OUTPUT
+                  echo "image-tag=$PRIMARY_TAG" >> $GITHUB_OUTPUT
+                  echo "repository=$ECR_REPOSITORY" >> $GITHUB_OUTPUT
+
+                  # For logging purposes
+                  ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+                  IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+
+                  echo "📦 Generated image tags:"
+                  echo "  Primary: $PRIMARY_TAG"
+                  echo "  Build: $BUILD_TAG"
+                  echo "  Version: $VERSION_TAG"
+                  echo "  Repository: $ECR_REPOSITORY"
+                  echo "  Registry: (masked for security)"
+
+            - name: Check if Image Already Exists
+              id: check-image
+              run: |
+                  PRIMARY_TAG="${{ steps.meta.outputs.primary-tag }}"
+                  ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+                  IMAGE_URI="${ECR_REGISTRY}/${{ steps.meta.outputs.repository }}"
+
+                  echo "🔍 Checking if image $IMAGE_URI:$PRIMARY_TAG already exists..."
+
+                  if aws ecr describe-images \
+                    --repository-name $ECR_REPOSITORY \
+                    --image-ids imageTag=$PRIMARY_TAG \
+                    --region us-east-1 > /dev/null 2>&1; then
+                    echo "✅ Image already exists: $IMAGE_URI:$PRIMARY_TAG"
+                    echo "exists=true" >> $GITHUB_OUTPUT
+                  else
+                    echo "❌ Image does not exist, will build: $IMAGE_URI:$PRIMARY_TAG"
+                    echo "exists=false" >> $GITHUB_OUTPUT
+                  fi
+
+            - name: Setup Bun
+              if: steps.check-image.outputs.exists == 'false' || github.event.inputs.force_rebuild == 'true'
+              uses: oven-sh/setup-bun@v1
+              with:
+                  bun-version: latest
+
+            - name: Cache Bun Dependencies
+              if: steps.check-image.outputs.exists == 'false' || github.event.inputs.force_rebuild == 'true'
+              uses: actions/cache@v4
+              with:
+                  path: ~/.bun/install/cache
+                  key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb') }}
+                  restore-keys: |
+                      ${{ runner.os }}-bun-
+
+            - name: Install Dependencies
+              if: steps.check-image.outputs.exists == 'false' || github.event.inputs.force_rebuild == 'true'
+              run: bun install --frozen-lockfile
+
+            - name: Generate Prisma Client
+              if: steps.check-image.outputs.exists == 'false' || github.event.inputs.force_rebuild == 'true'
+              run: bun prisma generate
+
+            - name: Build Application
+              if: steps.check-image.outputs.exists == 'false' || github.event.inputs.force_rebuild == 'true'
+              run: bun run build
+
+            - name: Fetch API Keys from AWS Secrets Manager
+              if: steps.check-image.outputs.exists == 'false' || github.event.inputs.force_rebuild == 'true'
+              run: |
+                  echo "🔍 Fetching API keys from AWS Secrets Manager..."
+
+                  SECRET_JSON=$(aws secretsmanager get-secret-value \
+                    --secret-id "v3-backend/development/config" \
+                    --query SecretString \
+                    --output text \
+                    --region us-east-1)
+
+                  if [ $? -ne 0 ]; then
+                    echo "❌ Failed to fetch secrets from AWS Secrets Manager"
+                    exit 1
+                  fi
+
+                  echo "✅ Successfully fetched secrets from AWS"
+
+                  # Extract API keys and config from JSON
+                  THEGRAPH_BALANCER_KEY=$(echo "$SECRET_JSON" | jq -r '.THEGRAPH_API_KEY_BALANCER // empty')
+                  THEGRAPH_FANTOM_KEY=$(echo "$SECRET_JSON" | jq -r '.THEGRAPH_API_KEY_FANTOM // empty')
+                  WHITELISTED_CHAINS=$(echo "$SECRET_JSON" | jq -r '.WHITELISTED_CHAINS // empty')
+
+                  # Validate that we have the required API keys
+                  if [ -z "$THEGRAPH_BALANCER_KEY" ] || [ -z "$THEGRAPH_FANTOM_KEY" ]; then
+                    echo "❌ Required API keys not found in secret"
+                    exit 1
+                  fi
+
+                  echo "✅ API keys validated successfully"
+
+                  # Store in environment for Docker build
+                  echo "THEGRAPH_BALANCER_KEY=$THEGRAPH_BALANCER_KEY" >> $GITHUB_ENV
+                  echo "THEGRAPH_FANTOM_KEY=$THEGRAPH_FANTOM_KEY" >> $GITHUB_ENV
+                  echo "WHITELISTED_CHAINS=$WHITELISTED_CHAINS" >> $GITHUB_ENV
+
+            - name: Build and Push Docker Image
+              if: steps.check-image.outputs.exists == 'false' || github.event.inputs.force_rebuild == 'true'
+              run: |
+                  PRIMARY_TAG="${{ steps.meta.outputs.primary-tag }}"
+                  BUILD_TAG="${{ steps.meta.outputs.build-tag }}"
+                  VERSION_TAG="${{ steps.meta.outputs.version-tag }}"
+                  ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+                  IMAGE_URI="${ECR_REGISTRY}/${{ steps.meta.outputs.repository }}"
+
+                  echo "🔨 Building Docker image with multiple tags..."
+                  echo "📦 Primary tag: $PRIMARY_TAG"
+                  echo "🏗️  Build tag: $BUILD_TAG"
+                  echo "📋 Version tag: $VERSION_TAG"
+
+                  # Build with BuildKit secrets using temporary files
+                  echo "$THEGRAPH_BALANCER_KEY" > /tmp/thegraph_balancer_key
+                  echo "$THEGRAPH_FANTOM_KEY" > /tmp/thegraph_fantom_key
+
+                  # Build image with primary tag
+                  docker buildx build \
+                    --secret id=thegraph_balancer,src=/tmp/thegraph_balancer_key \
+                    --secret id=thegraph_fantom,src=/tmp/thegraph_fantom_key \
+                    --platform linux/amd64 \
+                    --build-arg NODE_ENV=production \
+                    --build-arg WHITELISTED_CHAINS="$WHITELISTED_CHAINS" \
+                    --build-arg BUILD_VERSION=${{ steps.meta.outputs.primary-tag }} \
+                    --build-arg BUILD_GIT_HASH=${{ github.sha }} \
+                    --build-arg BUILD_GIT_SHORT_HASH=${{ steps.meta.outputs.commit-sha }} \
+                    --build-arg BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+                    --build-arg DEPLOYMENT_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+                    --tag "$IMAGE_URI:$PRIMARY_TAG" \
+                    --push .
+
+                  # Clean up temporary files
+                  rm -f /tmp/thegraph_balancer_key /tmp/thegraph_fantom_key
+
+                  echo "🏷️  Creating additional tags..."
+                  # Tag with build number
+                  docker buildx imagetools create \
+                    "$IMAGE_URI:$PRIMARY_TAG" \
+                    --tag "$IMAGE_URI:$BUILD_TAG"
+
+                  # Tag with version
+                  docker buildx imagetools create \
+                    "$IMAGE_URI:$PRIMARY_TAG" \
+                    --tag "$IMAGE_URI:$VERSION_TAG"
+
+                  # Tag as latest for dev convenience
+                  docker buildx imagetools create \
+                    "$IMAGE_URI:$PRIMARY_TAG" \
+                    --tag "$IMAGE_URI:latest"
+
+                  echo "✅ Image built and tagged successfully"
+
+            - name: Output Image Information
+              run: |
+                  PRIMARY_TAG="${{ steps.meta.outputs.primary-tag }}"
+                  ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+                  IMAGE_URI="${ECR_REGISTRY}/${{ steps.meta.outputs.repository }}"
+
+                  echo "🎉 Docker image build completed!"
+                  echo ""
+                  echo "📊 Image Details:"
+                  echo "  Repository: $ECR_REPOSITORY"
+                  echo "  Primary Tag: $PRIMARY_TAG"
+                  echo "  Build Tag: ${{ steps.meta.outputs.build-tag }}"
+                  echo "  Version Tag: ${{ steps.meta.outputs.version-tag }}"
+                  echo "  Image URI: $IMAGE_URI:$PRIMARY_TAG"
+                  echo ""
+                  echo "🔗 Usage:"
+                  echo "  Deploy to dev: Use 'latest' or '$PRIMARY_TAG'"
+                  echo "  Deploy to staging: Use '$PRIMARY_TAG'"
+                  echo "  Deploy to production: Use '$PRIMARY_TAG'"
+
+            - name: Create Workflow Summary
+              if: always()
+              run: |
+                  PRIMARY_TAG="${{ steps.meta.outputs.primary-tag }}"
+                  BUILD_TAG="${{ steps.meta.outputs.build-tag }}"
+                  VERSION_TAG="${{ steps.meta.outputs.version-tag }}"
+                  COMMIT_SHA="${{ steps.meta.outputs.commit-sha }}"
+                  BUILD_NUMBER="${{ steps.meta.outputs.build-number }}"
+
+                  # Check if image was built or already existed
+                  if [ "${{ steps.check-image.outputs.exists }}" == "true" ] && [ "${{ github.event.inputs.force_rebuild }}" != "true" ]; then
+                    BUILD_STATUS="♻️ Image already exists (skipped build)"
+                  else
+                    BUILD_STATUS="✅ Image built successfully"
+                  fi
+
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+                  # 🐳 Docker Build Summary
+
+                  ## 📦 Primary Image Tag
+                  \`\`\`
+                  $PRIMARY_TAG
+                  \`\`\`
+
+                  ## 📊 Build Details
+                  | Field | Value |
+                  |-------|-------|
+                  | **Status** | $BUILD_STATUS |
+                  | **Repository** | \`$ECR_REPOSITORY\` |
+                  | **Primary Tag** | \`$PRIMARY_TAG\` |
+                  | **Version Tag** | \`$VERSION_TAG\` |
+                  | **Build Tag** | \`$BUILD_TAG\` |
+                  | **Commit SHA** | \`$COMMIT_SHA\` |
+                  | **Build Number** | \`#$BUILD_NUMBER\` |
+                  | **Trigger** | ${{ github.event_name }} |
+
+                  ## 🚀 Deployment Commands
+
+                  ### Deploy to Development
+                  \`\`\`bash
+                  # Using GitHub Actions
+                  Environment: dev
+                  Image Tag: $PRIMARY_TAG
+                  \`\`\`
+
+                  ### Deploy to Staging
+                  \`\`\`bash
+                  # Using GitHub Actions
+                  Environment: staging
+                  Image Tag: $PRIMARY_TAG
+                  \`\`\`
+
+                  ### Deploy to Production
+                  \`\`\`bash
+                  # Using GitHub Actions
+                  Environment: production
+                  Image Tag: $PRIMARY_TAG
+                  Confirmation: DEPLOY TO PRODUCTION
+                  \`\`\`
+
+                  ## 🔗 Quick Actions
+                  - [Deploy this image](https://github.com/${{ github.repository }}/actions/workflows/deploy-code.yml)
+                  - [View all images](https://console.aws.amazon.com/ecr/repositories/private/${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY)
+                  EOF
+
+            - name: Store Build Metadata
+              run: |
+                  # Create build metadata file
+                  cat > build-metadata.json << EOF
+                  {
+                    "version": "${{ steps.meta.outputs.version }}",
+                    "commit_sha": "${{ steps.meta.outputs.commit-sha }}",
+                    "build_number": "${{ steps.meta.outputs.build-number }}",
+                    "primary_tag": "${{ steps.meta.outputs.primary-tag }}",
+                    "build_tag": "${{ steps.meta.outputs.build-tag }}",
+                    "version_tag": "${{ steps.meta.outputs.version-tag }}",
+                    "repository": "${{ steps.meta.outputs.repository }}",
+                    "build_time": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+                    "git_ref": "${{ github.ref_name }}",
+                    "git_sha": "${{ github.sha }}",
+                    "workflow_run_id": "${{ github.run_id }}",
+                    "workflow_run_number": "${{ github.run_number }}"
+                  }
+                  EOF
+
+                  echo "📋 Build metadata saved to build-metadata.json"
+
+            - name: Upload Build Metadata
+              uses: actions/upload-artifact@v4
+              with:
+                  name: build-metadata
+                  path: build-metadata.json
+                  retention-days: 90
+
+    trigger-dev-deployment:
+        name: Trigger Development Deployment
+        needs: build
+        runs-on: ubuntu-latest
+        if: github.event_name == 'push' && github.ref_name == 'develop'
+
+        steps:
+            - name: Trigger Development Deployment
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      github.rest.actions.createWorkflowDispatch({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        workflow_id: 'deploy-code.yml',
+                        ref: 'develop',
+                        inputs: {
+                          environment: 'dev',
+                          image_tag: '${{ needs.build.outputs.image-tag }}'
+                        }
+                      });
+
+                      console.log('🚀 Triggered development deployment with image tag: ${{ needs.build.outputs.image-tag }}');

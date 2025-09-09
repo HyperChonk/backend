@@ -1,0 +1,332 @@
+# HyperChonk API
+
+Welcome to HyperChonk's API. This guide will help you get started with using the API and accessing the data locked in HyperChonk's contracts.
+
+# Development
+
+## Quick Start
+
+The easiest way to get started with local development is using our automated setup script:
+
+```sh
+# Start all services in development mode with hot reloading
+./scripts/start-local.sh dev
+
+# Or start in production mode
+./scripts/start-local.sh
+```
+
+The script will automatically:
+
+-   Set up the development environment
+-   Start all required services (PostgreSQL, Redis, LocalStack, API, Worker, Scheduler)
+-   Run database migrations
+-   Initialize AWS resources in LocalStack
+-   Validate that all services are properly configured and functional
+-   Show you available endpoints and useful commands
+
+### Available Script Commands
+
+```sh
+./scripts/start-local.sh dev      # Development mode with hot reloading
+./scripts/start-local.sh stop     # Stop all services
+./scripts/start-local.sh clean    # Stop services and clean volumes
+./scripts/start-local.sh wipe     # Complete reset (removes everything)
+./scripts/start-local.sh status   # Show service status
+./scripts/start-local.sh validate # Run comprehensive validation tests
+./scripts/start-local.sh logs     # Follow all logs
+./scripts/start-local.sh help     # Show all available commands
+```
+
+### Environment Configuration
+
+The script will create a `.env` file from the template if one doesn't exist. You may need to add your API keys:
+
+```env
+THEGRAPH_API_KEY_FANTOM=your_key_here
+THEGRAPH_API_KEY_BALANCER=your_key_here
+```
+
+## AWS Deployment & Secrets Configuration
+
+For AWS deployment, this project uses AWS CDK with comprehensive infrastructure including ECS Fargate, RDS PostgreSQL, S3, SQS, and more.
+
+### **📋 Prerequisites**
+
+-   AWS CLI configured with appropriate permissions
+-   CDK v2 installed globally
+-   Docker for container builds
+
+### **🔐 Secrets Management**
+
+Before deploying, you must configure secrets in AWS Secrets Manager. See the comprehensive [Secrets Reference Documentation](./infrastructure/docs/secrets-reference.md) for:
+
+-   All required secret keys and their purposes
+-   Secret templates for each environment
+-   Setup instructions using AWS Console, CLI, or scripts
+
+### **🚀 Deployment**
+
+There are two main deployment approaches:
+
+#### **Full Infrastructure + Application Deployment**
+
+For complete deployments including infrastructure changes:
+
+```sh
+# Navigate to infrastructure
+cd infrastructure
+
+# Bootstrap CDK (first time only)
+npm run bootstrap
+
+# Deploy everything (infrastructure + application)
+npm run deploy:dev
+npm run deploy:staging
+npm run deploy:prod
+```
+
+#### **Code-Only Deployment**
+
+For faster application updates without infrastructure changes:
+
+```sh
+# Deploy only application code with pre-built image
+npm run deploy:dev:code-only
+npm run deploy:staging:code-only
+npm run deploy:prod:code-only
+```
+
+#### **GitHub Actions Workflows**
+
+The project uses two GitHub Actions workflows:
+
+-   **deploy.yml**: Full deployment (infrastructure + application)
+
+    -   Triggered manually or can be configured for specific branches
+    -   Accepts a Docker image tag as input
+    -   Deploys complete infrastructure stack
+
+-   **deploy-code.yml**: Code-only deployment
+    -   Faster deployment for application updates
+    -   Uses pre-built Docker images from ECR
+    -   Updates ECS services without touching infrastructure
+
+### **📚 Infrastructure Documentation**
+
+-   [📖 Secrets Reference](./infrastructure/docs/secrets-reference.md) - Complete secrets configuration guide
+-   [🛠️ Bootstrap Check Script](./infrastructure/scripts/check-bootstrap.js) - Automatic CDK bootstrap detection
+-   [🔐 Secrets Initialization](./infrastructure/scripts/init-secrets.sh) - Secret management utilities
+
+### Initialize Database with Initial Data
+
+After starting the services with the setup script, you can populate the database with initial data using these mutations:
+
+```
+poolSyncAllPoolsFromSubgraph
+poolReloadStakingForAllPools
+userInitWalletBalancesForAllPools
+userInitStakedBalances
+```
+
+Access the GraphQL playground at `http://localhost:4000/graphql` or use curl:
+
+```bash
+curl -d '{"query":"mutation { poolSyncAllPoolsFromSubgraph }"}' \
+  -H 'Content-Type: application/json' \
+  -H 'chainId: 1' \
+  -H "AdminApiKey: $(grep '^ADMIN_API_KEY=' .env | cut -d '=' -f2)" \
+  http://localhost:4000/graphql
+```
+
+## Getting started
+
+The API is running as a graphql server and is deployed at: [https://api-v3.balancer.fi](https://api-v3.balancer.fi)
+
+## Use cases
+
+Queries are organised around these main domains:
+
+-   Pools
+    -   poolGetPool
+    -   poolGetPools
+-   Gauges
+    -   veBalGetUser
+    -   veBalGetUserBalance
+    -   veBalGetVotingList
+-   Events
+    -   poolGetEvents
+-   Users
+    -   userGetPoolBalances
+    -   userGetStaking
+-   Tokens
+    -   tokenGetTokens
+    -   tokenGetTokenDynamicData
+    -   tokenGetTokensDynamicData
+    -   tokenGetTokenData
+    -   tokenGetTokensData
+-   Prices
+    -   tokenGetCurrentPrices
+    -   tokenGetHistoricalPrices
+-   SOR
+    -   sorGetSwapPaths
+
+To query specific data refer to the [API's documentation](https://api-v3.balancer.fi/). Click top left to show the Documentation Explorer.
+
+Most of the queries will take one or multiple `chain` as an argument. The usage of the `chainId` header is deprecated!
+
+## Chain Support Configuration
+
+The API supports selective chain enabling/disabling. Unsupported chains return empty data instead of errors, maintaining API compatibility while reducing infrastructure costs.
+
+### Control Supported Chains
+
+Edit `config/chain-support-wrapper.ts` to control which chains are active:
+
+```typescript
+export const SUPPORTED_CHAINS: Chain[] = [
+    'POLYGON',
+    'HYPEREVM',
+    // 'MAINNET',    // Disabled - returns empty data
+    // 'ARBITRUM',   // Disabled - returns empty data
+    // 'BASE',       // Disabled - returns empty data
+] as const;
+```
+
+### How It Works
+
+-   **Supported chains**: Return real data from subgraphs
+-   **Unsupported chains**: Return empty arrays/null (no errors)
+-   **Build-time**: All configs kept intact for TypeScript generation
+-   **Runtime**: Smart detection handles the filtering automatically
+
+This approach allows you to quickly disable expensive chains while maintaining API stability.
+
+## Examples
+
+How to get the pool's details including APRs.
+
+```
+{
+  poolGetPool(id: "0x7f2b3b7fbd3226c5be438cde49a519f442ca2eda00020000000000000000067d", chain:MAINNET) {
+    id
+    name
+    type
+    version
+    allTokens {
+      address
+      name
+    }
+    poolTokens {
+      address
+      symbol
+      balance
+      hasNestedPool
+    }
+    dynamicData {
+      totalLiquidity
+      aprItems {
+        title
+        type
+        apr
+      }
+    }
+  }
+}
+```
+
+Query all pools on Arbitrum and Avalanche that have TVL greater than $10k:
+
+```
+{
+  poolGetPools(where: {chainIn: [AVALANCHE, ARBITRUM], minTvl: 10000}) {
+    id
+    address
+    name
+  }
+}
+```
+
+Query the SOR to swap 1 WETH to USDC
+
+```
+{
+  sorGetSwapPaths(
+    chain: MAINNET
+    swapAmount: "1"
+    swapType: EXACT_IN
+    tokenIn: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+    tokenOut: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+  ) {
+    swapAmountRaw
+    returnAmountRaw
+    priceImpact {
+      priceImpact
+      error
+    }
+  }
+}
+```
+
+## Pricing of tokens
+
+First of all, for a token to be able to have a price it must be allowed, meaning it must be added to the [tokenlist](https://github.com/balancer/tokenlists). This must happen _before_ any pricing can occur.
+
+To price a token there are various handlers that will try to price a token. These handlers take priority over each other. This means that as soon
+as a handler can price a token, it will not be price by another handler. These handlers, order by priority, are:
+
+1. Protocol specific handlers such as Aave or fbeets where prices can be infered via on-chain calls and underlying token prices
+2. Coingecko
+3. BPT price handler ($TVL/totalShares)
+4. Swaps (When ever a token is swapped with a token that has a price, the original token's price is inferred relative to the swapped token)
+
+In addition to this, there are manual interventions possible:
+
+1. If a token has a wrong Coingecko feed, it can be excluded by adding [an override](https://github.com/balancer/tokenlists/blob/main/src/tokenlists/balancer/overwrites.ts#L406) like this `extensions: { coingeckoId: null, },`.
+2. If a token does not have a Coingecko feed on a specific chain, or can be priced using a different token's Coingecko feed, the Coingecko ID can [be overridden](https://github.com/balancer/tokenlists/blob/main/src/tokenlists/balancer/overwrites.ts#L393) with another ID like this `extensions: { coingeckId: 'gyroscope-gyd', },`.
+
+### Setup database & Prisma from backup
+
+Retrieve the current pg_dump file under `https://api-db-dump.s3.eu-central-1.amazonaws.com/canary/api-dump.YYYYMMDD`.
+Database dumps are kept for the previous 7 days, replace YYYYMMDD in the URL above (ie: 20230317) to download a db dump.
+
+Run `docker compose up -d` to start the database via docker compose.
+
+Run `docker exec -i $(docker ps -qf "name=balancer-backend") /bin/bash -c "PGPASSWORD=let-me-in psql --username backend database" < /path/on/your/machine/dump`
+
+The output at the very end saying `ERROR: role "rdsadmin" does not exist` is normal and can be ignored.
+
+## Run locally
+
+Use the automated setup script for the best development experience:
+
+```bash
+# Development mode with hot reloading
+./scripts/start-local.sh dev
+
+# Follow logs for debugging
+./scripts/start-local.sh logs
+
+# Stop when done
+./scripts/start-local.sh stop
+```
+
+The API will be available at `http://localhost:4000/graphql` with full GraphQL playground support.
+
+## Branching and deployment environments
+
+We run development, staging, and production deployment environments.
+The development environment is typically deployed from the `develop` branch,
+staging from the `staging` branch, and production from the `main` branch. The environments can be accessed through the following links:
+
+https://backend-v3.beets-ftm-node.com/
+
+https://api-v3.balancer.fi/
+
+## Contributing
+
+To contribute, branch from `v3-canary` (which is our development branch) and open a PR against `v3-canary` once the feature is complete. It will be reviewed and eventually merged into v2-canary.
+
+### Database Updates
+
+If you make any changes to the database schema be sure to run `yarn prisma migrate dev --name <change_name>` which will create a new file in `prisma/migrations` that contains all the database changes you've made as an SQL update script.

@@ -1,0 +1,34 @@
+services:
+    localstack:
+        container_name: localstack-test
+        image: localstack/localstack:3.0
+        ports:
+            - '127.0.0.1:4566:4566' # LocalStack Gateway
+            - '127.0.0.1:4510-4559:4510-4559' # External services port range
+        environment:
+            # LocalStack configuration
+            - DEBUG=${DEBUG-0}
+            - LAMBDA_EXECUTOR=docker
+            - DOCKER_HOST=unix:///var/run/docker.sock
+            - DISABLE_CORS_CHECKS=1
+
+            # AWS Services to enable
+            - SERVICES=cloudformation,s3,sqs,secretsmanager,ec2,ecs,rds,logs,iam,elbv2,wafv2,ssm
+
+            # Persistence (optional - uncomment to persist data between runs)
+            # - PERSISTENCE=1
+            # - DATA_DIR=/tmp/localstack/data
+
+            # Disable some features for faster startup
+            - SKIP_INFRA_DOWNLOADS=0
+            - LAMBDA_REMOVE_CONTAINERS=true
+
+        volumes:
+            - '${TMPDIR:-/tmp}/localstack:/var/lib/localstack'
+            - '/var/run/docker.sock:/var/run/docker.sock'
+        networks:
+            - localstack-test
+
+networks:
+    localstack-test:
+        driver: bridge

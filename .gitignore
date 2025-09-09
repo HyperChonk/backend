@@ -1,0 +1,49 @@
+.claude/
+.idea/
+.vscode/
+.DS_Store
+.env.sample
+.env.dev
+.env
+node_modules/
+*-debug.log
+*-error.log
+
+debug
+debug.ts
+i18n/*
+google-service-account.json
+omni.config.ts
+app.json
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
+.ebextensions/*
+.platform/*
+Users/
+dist
+.env*
+
+# Added by Claude Task Master
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dev-debug.log
+# Dependency directories
+# Environment variables
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# OS specific
+# Task files
+tasks.json
+tasks/ 

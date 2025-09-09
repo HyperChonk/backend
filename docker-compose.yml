@@ -1,0 +1,258 @@
+services:
+    # PostgreSQL Database
+    postgres:
+        container_name: balancer-postgres
+        image: postgres:15-alpine
+        restart: unless-stopped
+        ports:
+            - '127.0.0.1:5431:5432'
+        environment:
+            POSTGRES_USER: backend
+            POSTGRES_PASSWORD: let-me-in
+            POSTGRES_DB: database
+            POSTGRES_INITDB_ARGS: '--encoding=UTF-8'
+            # Fix locale warnings in Alpine
+            LC_ALL: C
+            LANG: C
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+            - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+        networks:
+            - balancer
+        healthcheck:
+            test:
+                [
+                    'CMD-SHELL',
+                    'pg_isready -U backend -d database && psql -U backend -d database -c "SELECT 1" > /dev/null',
+                ]
+            interval: 5s
+            timeout: 10s
+            retries: 12
+            start_period: 30s
+
+    # Redis for caching (optional but useful for performance)
+    redis:
+        container_name: balancer-redis
+        image: redis:7-alpine
+        restart: unless-stopped
+        ports:
+            - '127.0.0.1:6379:6379'
+        networks:
+            - balancer
+        healthcheck:
+            test: ['CMD', 'redis-cli', 'ping']
+            interval: 10s
+            timeout: 5s
+            retries: 3
+
+    # LocalStack for local AWS services (SQS, S3, CloudWatch, SNS, etc.)
+    localstack:
+        container_name: balancer-localstack
+        image: localstack/localstack:3.0
+        restart: unless-stopped
+        ports:
+            - '127.0.0.1:4566:4566' # LocalStack main port
+            - '127.0.0.1:4571:4571' # Legacy port (for compatibility)
+        environment:
+            - SERVICES=sqs,s3,secretsmanager,ssm,cloudwatch,sns,logs
+            - DEBUG=1
+            - DATA_DIR=/var/lib/localstack
+            - DOCKER_HOST=unix:///var/run/docker.sock
+            - PERSISTENCE=1
+            - LAMBDA_EXECUTOR=docker
+            - HOSTNAME_EXTERNAL=localstack
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock
+            - localstack_data:/var/lib/localstack
+            - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init-aws-resources.sh:ro
+        networks:
+            - balancer
+        healthcheck:
+            test: ['CMD-SHELL', 'awslocal s3 ls > /dev/null 2>&1 && awslocal sqs list-queues > /dev/null 2>&1']
+            interval: 10s
+            timeout: 15s
+            retries: 15
+            start_period: 90s
+
+    # Main API Service
+    api:
+        container_name: balancer-api
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: runtime
+            args:
+                NODE_ENV: development
+                ENVIRONMENT: local
+                THEGRAPH_API_KEY_BALANCER: ${THEGRAPH_API_KEY_BALANCER:-demo-key}
+                THEGRAPH_API_KEY_FANTOM: ${THEGRAPH_API_KEY_FANTOM:-demo-key}
+                ADMIN_API_KEY: ${ADMIN_API_KEY:-local-admin-key-123}
+                SANITY_API_TOKEN: ${SANITY_API_TOKEN:-demo-token}
+                SENTRY_DSN: ${SENTRY_DSN:-https://demo@demo.ingest.sentry.io/demo}
+                SENTRY_AUTH_TOKEN: ${SENTRY_AUTH_TOKEN:-demo-token}
+                WHITELISTED_CHAINS: ${WHITELISTED_CHAINS:-250}
+        restart: unless-stopped
+        ports:
+            - '127.0.0.1:4000:4000'
+        environment: &common-env # Basic config
+            NODE_ENV: development
+            DEPLOYMENT_ENV: local
+            PORT: 4000
+            LOG_LEVEL: debug
+
+            # Database
+            DATABASE_URL: postgresql://backend:let-me-in@postgres:5432/database?schema=public
+
+            # Service config
+            SERVICE_TYPE: api
+            WORKER: 'false'
+            SCHEDULER: 'false'
+            AWS_ALERTS: 'false'
+
+            # Chain config
+            DEFAULT_CHAIN_ID: ${DEFAULT_CHAIN_ID:-'250'}
+            PROTOCOL: balancer
+            WHITELISTED_CHAINS: ${WHITELISTED_CHAINS:-'1,10,137,250,42161,43114,8453,100'}
+
+            # AWS LocalStack configuration
+            AWS_REGION: us-east-1
+            AWS_ENDPOINT_URL: http://localstack:4566
+            AWS_ACCESS_KEY_ID: test
+            AWS_SECRET_ACCESS_KEY: test
+
+            # SQS Queue URLs (LocalStack)
+            SQS_BACKGROUND_JOB_QUEUE_URL: http://localstack:4566/000000000000/v3-backend-local-background-job-queue
+            SQS_DATA_REFRESH_QUEUE_URL: http://localstack:4566/000000000000/v3-backend-local-data-refresh-queue
+            SQS_NOTIFICATION_QUEUE_URL: http://localstack:4566/000000000000/v3-backend-local-notification-queue
+
+            # External services (you'll need to add your keys)
+            THEGRAPH_API_KEY_FANTOM: ${THEGRAPH_API_KEY_FANTOM:-demo-key}
+            THEGRAPH_API_KEY_BALANCER: ${THEGRAPH_API_KEY_BALANCER:-demo-key}
+            COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
+            RPC_URL_TEMPLATE: ${RPC_URL_TEMPLATE:-https://rpc.ankr.com/$${network}/$${apiKey}}
+            RPC_API_KEY: ${RPC_API_KEY:-}
+
+            # Monitoring
+            SENTRY_DSN: ${SENTRY_DSN:-https://demo@demo.ingest.sentry.io/demo}
+            SENTRY_AUTH_TOKEN: ${SENTRY_AUTH_TOKEN:-demo-token}
+            SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-'0.1'}
+            SENTRY_PROFILES_SAMPLE_RATE: ${SENTRY_PROFILES_SAMPLE_RATE:-'0.1'}
+
+            # Admin
+            ADMIN_API_KEY: ${ADMIN_API_KEY:-local-admin-key-123}
+            SANITY_API_TOKEN: ${SANITY_API_TOKEN:-demo-token}
+
+        networks:
+            - balancer
+        depends_on:
+            postgres:
+                condition: service_healthy
+            localstack:
+                condition: service_healthy
+        healthcheck:
+            test:
+                [
+                    'CMD-SHELL',
+                    'curl -f http://localhost:4000/health && curl -f http://localhost:4000/graphql -H "Content-Type: application/json" -d "{\"query\":\"{ __typename }\"}" | grep -q "data"',
+                ]
+            interval: 15s
+            timeout: 15s
+            retries: 8
+            start_period: 120s
+
+    # Background Worker Service
+    worker:
+        container_name: balancer-worker
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: runtime
+            args:
+                NODE_ENV: development
+                ENVIRONMENT: local
+                THEGRAPH_API_KEY_BALANCER: ${THEGRAPH_API_KEY_BALANCER:-demo-key}
+                THEGRAPH_API_KEY_FANTOM: ${THEGRAPH_API_KEY_FANTOM:-demo-key}
+                ADMIN_API_KEY: ${ADMIN_API_KEY:-local-admin-key-123}
+                SANITY_API_TOKEN: ${SANITY_API_TOKEN:-demo-token}
+                SENTRY_DSN: ${SENTRY_DSN:-https://demo@demo.ingest.sentry.io/demo}
+                SENTRY_AUTH_TOKEN: ${SENTRY_AUTH_TOKEN:-demo-token}
+                WHITELISTED_CHAINS: ${WHITELISTED_CHAINS:-250}
+        restart: unless-stopped
+        ports:
+            - '127.0.0.1:8080:8080' # Health check port
+        environment:
+            <<: *common-env
+            # Service config - SQS polling worker
+            SERVICE_TYPE: worker
+            WORKER: 'true'
+            SCHEDULER: 'false'
+            HEALTH_PORT: 8080
+        networks:
+            - balancer
+        depends_on:
+            api:
+                condition: service_healthy
+            postgres:
+                condition: service_healthy
+            localstack:
+                condition: service_healthy
+        healthcheck:
+            test: ['CMD-SHELL', 'curl -f http://localhost:8080/health/deep || exit 1']
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 60s
+
+    # Scheduler Service
+    scheduler:
+        container_name: balancer-scheduler
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: runtime
+            args:
+                NODE_ENV: development
+                ENVIRONMENT: local
+                THEGRAPH_API_KEY_BALANCER: ${THEGRAPH_API_KEY_BALANCER:-demo-key}
+                THEGRAPH_API_KEY_FANTOM: ${THEGRAPH_API_KEY_FANTOM:-demo-key}
+                ADMIN_API_KEY: ${ADMIN_API_KEY:-local-admin-key-123}
+                SANITY_API_TOKEN: ${SANITY_API_TOKEN:-demo-token}
+                SENTRY_DSN: ${SENTRY_DSN:-https://demo@demo.ingest.sentry.io/demo}
+                SENTRY_AUTH_TOKEN: ${SENTRY_AUTH_TOKEN:-demo-token}
+                WHITELISTED_CHAINS: ${WHITELISTED_CHAINS:-250}
+        restart: unless-stopped
+        ports:
+            - '127.0.0.1:8081:8081' # Health check port
+        environment:
+            <<: *common-env
+            # Service config - SQS message sender
+            SERVICE_TYPE: scheduler
+            WORKER: 'false'
+            SCHEDULER: 'true'
+            HEALTH_PORT: 8081
+        networks:
+            - balancer
+        depends_on:
+            api:
+                condition: service_healthy
+            postgres:
+                condition: service_healthy
+            localstack:
+                condition: service_healthy
+        healthcheck:
+            test: ['CMD-SHELL', 'curl -f http://localhost:8081/health/deep || exit 1']
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 60s
+
+networks:
+    balancer:
+        name: balancer
+        driver: bridge
+
+volumes:
+    postgres_data:
+        name: balancer_postgres_data
+    localstack_data:
+        name: balancer_localstack_data

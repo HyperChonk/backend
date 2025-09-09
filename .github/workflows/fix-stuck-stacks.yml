@@ -1,0 +1,243 @@
+name: Fix Stuck CloudFormation Stacks
+
+# This workflow can be triggered manually to fix stuck CloudFormation stacks
+# It uses the enhanced fix-stuck-stack.ts script with various options
+
+env:
+    AWS_REGION: us-east-1 # Default region, can be overridden
+
+on:
+    workflow_dispatch:
+        inputs:
+            environment:
+                description: 'Environment to fix stacks for'
+                required: true
+                default: 'dev'
+                type: choice
+                options:
+                    - dev
+                    - staging
+                    - production
+            stack_name:
+                description: 'Specific stack name to fix (optional - leave empty to check all stacks)'
+                required: false
+                default: ''
+            action_type:
+                description: 'Type of fix action to perform'
+                required: true
+                default: 'auto-fix'
+                type: choice
+                options:
+                    - auto-fix # Try to fix and skip unfixable resources
+                    - dry-run # Show what would be done without making changes
+                    - force-delete # Force delete stuck stacks (DANGEROUS)
+                    - delete-in-progress # Delete stacks that are in progress
+            confirm_production:
+                description: 'Type "CONFIRM PRODUCTION FIX" to proceed with production fixes'
+                required: false
+                default: ''
+
+jobs:
+    # Validate inputs and setup
+    validate:
+        name: Validate Fix Request
+        runs-on: ubuntu-latest
+        outputs:
+            can-proceed: ${{ steps.validation.outputs.can-proceed }}
+            action-flags: ${{ steps.validation.outputs.action-flags }}
+
+        steps:
+            - name: Validate production confirmation
+              if: github.event.inputs.environment == 'production'
+              run: |
+                  if [ "${{ github.event.inputs.confirm_production }}" != "CONFIRM PRODUCTION FIX" ]; then
+                    echo "❌ Production fix confirmation failed"
+                    echo "You must type exactly: CONFIRM PRODUCTION FIX"
+                    exit 1
+                  fi
+                  echo "✅ Production fix confirmed"
+
+            - name: Setup action flags
+              id: validation
+              run: |
+                  # Convert action type to script flags
+                  case "${{ github.event.inputs.action_type }}" in
+                    "auto-fix")
+                      FLAGS="--skip-unfixable"
+                      ;;
+                    "dry-run")
+                      FLAGS="--skip-unfixable --dry-run"
+                      ;;
+                    "force-delete")
+                      FLAGS="--force-delete"
+                      ;;
+                    "delete-in-progress")
+                      FLAGS="--delete-in-progress --skip-unfixable"
+                      ;;
+                    *)
+                      FLAGS="--skip-unfixable"
+                      ;;
+                  esac
+
+                  # Add specific stack name if provided
+                  if [ -n "${{ github.event.inputs.stack_name }}" ]; then
+                    FLAGS="$FLAGS --stack-name ${{ github.event.inputs.stack_name }}"
+                  fi
+
+                  echo "action-flags=$FLAGS" >> $GITHUB_OUTPUT
+                  echo "can-proceed=true" >> $GITHUB_OUTPUT
+
+                  echo "🎯 Action: ${{ github.event.inputs.action_type }}"
+                  echo "🏷️ Flags: $FLAGS"
+
+    # Main fix job
+    fix-stacks:
+        name: Fix Stuck Stacks - ${{ github.event.inputs.environment }}
+        runs-on: ubuntu-latest
+        needs: validate
+        if: needs.validate.outputs.can-proceed == 'true'
+        timeout-minutes: 30
+
+        permissions:
+            id-token: write
+            contents: read
+            issues: write # For creating issues if things go wrong
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+                  role-session-name: GitHubActions-FixStuckStack-${{ github.event.inputs.environment }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Setup Node.js for infrastructure scripts
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '18'
+
+            - name: Install infrastructure dependencies
+              run: |
+                  cd infrastructure
+                  npm ci
+
+            - name: Validate AWS access and region
+              run: |
+                  echo "🔍 Validating AWS access..."
+                  echo "Region: $AWS_REGION"
+                  echo "Environment: ${{ github.event.inputs.environment }}"
+
+                  # Test basic AWS access
+                  aws sts get-caller-identity
+
+                  # Test CloudFormation access
+                  aws cloudformation describe-stacks --region $AWS_REGION --max-items 1 || echo "No stacks found (this is OK)"
+
+                  echo "✅ AWS access validated"
+
+            - name: Run Stuck Stack Fix
+              env:
+                  ENVIRONMENT: ${{ github.event.inputs.environment }}
+              run: |
+                  cd infrastructure
+
+                  echo "🔧 Starting stuck stack fix operation..."
+                  echo "   Environment: $ENVIRONMENT"
+                  echo "   Action: ${{ github.event.inputs.action_type }}"
+                  echo "   Flags: ${{ needs.validate.outputs.action-flags }}"
+                  echo "   Region: $AWS_REGION"
+                  echo ""
+
+                  # Run the fix with the determined flags
+                  if npx ts-node scripts/fix-stuck-stack.ts --environment $ENVIRONMENT ${{ needs.validate.outputs.action-flags }}; then
+                    echo ""
+                    echo "✅ Stuck stack fix completed successfully!"
+                    echo "🎯 Next steps:"
+                    echo "   1. Check the logs above for details"
+                    echo "   2. Monitor your infrastructure for stability"
+                    echo "   3. Retry failed deployments if needed"
+                  else
+                    EXIT_CODE=$?
+                    echo ""
+                    echo "❌ Stuck stack fix failed with exit code: $EXIT_CODE"
+                    echo "🔍 Check the logs above for error details"
+                    echo "💡 You may need to:"
+                    echo "   1. Run with different options (e.g., --force-delete)"
+                    echo "   2. Fix resources manually in AWS Console"
+                    echo "   3. Contact AWS Support for complex issues"
+                    exit $EXIT_CODE
+                  fi
+
+            - name: Create success summary
+              if: success()
+              run: |
+                  echo "🎉 **Stuck Stack Fix Successful!**" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "- **Environment**: ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+                  echo "- **Action**: ${{ github.event.inputs.action_type }}" >> $GITHUB_STEP_SUMMARY
+                  echo "- **Completed**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+                  echo "" >> $GITHUB_STEP_SUMMARY
+                  echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+                  echo "- ✅ Environment should be ready for new deployments" >> $GITHUB_STEP_SUMMARY
+                  echo "- 🔍 Monitor subsequent deployments for stability" >> $GITHUB_STEP_SUMMARY
+                  echo "- 📋 Check CloudFormation console to verify stack states" >> $GITHUB_STEP_SUMMARY
+
+            - name: Create failure issue
+              if: failure()
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      const issue = await github.rest.issues.create({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        title: `🚨 Stuck Stack Fix Failed - ${{ github.event.inputs.environment }}`,
+                        labels: ['infrastructure', 'urgent', 'cloudformation'],
+                        body: `
+                      ## Stuck Stack Fix Failed
+
+                      **Environment**: ${{ github.event.inputs.environment }}
+                      **Action**: ${{ github.event.inputs.action_type }}
+                      **Stack**: ${{ github.event.inputs.stack_name || 'Auto-detected' }}
+                      **Region**: ${{ env.AWS_REGION }}
+                      **Workflow**: [View Run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+
+                      ### ⚠️ Manual Intervention Required
+
+                      The automated stuck stack fix process failed. This may require:
+
+                      1. **Manual CloudFormation Stack Review**
+                         - Check AWS CloudFormation console for stack states
+                         - Look for resources that cannot be automatically fixed
+                         - Check for dependency issues or permission problems
+
+                      2. **Alternative Fix Options**
+                         - Try running with \`--force-delete\` (⚠️ **DANGEROUS**)
+                         - Fix individual resources manually in AWS console
+                         - Contact AWS Support for complex dependency issues
+
+                      3. **Emergency Procedures**
+                         - If this is blocking production, consider emergency rollback procedures
+                         - Document any manual changes made for future reference
+
+                      ### 🔍 Debugging Information
+
+                      - **Caller Identity**: Check if GitHub Actions has correct AWS permissions
+                      - **Stack Events**: Review CloudFormation stack events for specific error details
+                      - **Dependencies**: Look for missing or stuck dependent resources (ECS clusters, etc.)
+
+                      ### 📋 Next Steps
+
+                      1. Review the failed workflow logs: [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+                      2. Try manual fix via AWS Console or CLI
+                      3. Re-run this workflow with different options if needed
+                      4. Update this issue with resolution details for future reference
+
+                      ---
+                      *Auto-generated by stuck stack fix workflow failure*
+                      `;
+                      });
+
+                      console.log(\`Created issue: \${issue.data.html_url}\`);

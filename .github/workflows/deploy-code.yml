@@ -1,0 +1,741 @@
+name: Deploy Code Only
+
+# IMPORTANT: This workflow shares concurrency control with the "Deploy Infrastructure + Application" workflow
+# to prevent simultaneous deployments to the same environment, which could cause conflicts.
+
+# Global environment configuration
+env:
+    AWS_REGION: us-east-1
+    ECR_REPOSITORY: balancer-api
+    CDK_DISABLE_NOTICES: true
+
+# Concurrency control: Prevent parallel deployments per environment
+# Uses same concurrency group as infrastructure deployment to prevent conflicts
+# Normalizes environment names: development->dev, production->prod for consistency
+concurrency:
+    group: deployment-${{ (github.event.inputs.environment == 'development' && 'dev') || (github.event.inputs.environment == 'production' && 'prod') || github.event.inputs.environment }}
+    cancel-in-progress: false # Wait for current deployment to finish instead of canceling
+
+on:
+    workflow_dispatch:
+        inputs:
+            environment:
+                description: 'Environment to deploy to'
+                required: true
+                type: choice
+                options: [dev, staging, production]
+            image_tag:
+                description: 'Docker image tag to deploy (e.g., latest, 1.41.8-abc123def)'
+                required: true
+                type: string
+            confirm_production:
+                description: 'Type "DEPLOY TO PRODUCTION" to confirm production deployment'
+                required: false
+                default: ''
+
+jobs:
+    allow-only-develop:
+        name: Allow only develop branch
+        runs-on: ubuntu-latest
+        steps:
+            - name: Guard branch
+              if: ${{ github.ref_name != 'develop' }}
+              run: |
+                  echo "::error::This workflow can only be run from 'develop'. Selected: ${{ github.ref_name }}"
+                  exit 1
+    setup:
+        name: Setup and Environment Detection
+        runs-on: ubuntu-latest
+        needs: allow-only-develop
+        outputs:
+            environment: ${{ steps.env.outputs.environment }}
+            requires-approval: ${{ steps.env.outputs.requires-approval }}
+            image-tag: ${{ steps.env.outputs.image-tag }}
+        steps:
+            - name: Determine Environment and Image Tag
+              id: env
+              run: |
+                  ENV="${{ inputs.environment }}"
+                  IMAGE_TAG="${{ inputs.image_tag }}"
+
+                  # Validate required inputs
+                  if [ -z "$ENV" ] || [ -z "$IMAGE_TAG" ]; then
+                    echo "❌ Environment and image_tag are required"
+                    exit 1
+                  fi
+
+                  # Normalize environment name (dev -> development)
+                  case "$ENV" in
+                    "dev"|"development")
+                      NORMALIZED_ENV="development"
+                      ;;
+                    "staging"|"stage")
+                      NORMALIZED_ENV="staging"
+                      ;;
+                    "prod"|"production")
+                      NORMALIZED_ENV="production"
+                      ;;
+                    *)
+                      NORMALIZED_ENV="$ENV"
+                      ;;
+                  esac
+
+                  # Determine if approval is required
+                  REQUIRES_APPROVAL=$([ "$NORMALIZED_ENV" = "production" ] && echo "true" || echo "false")
+
+                  echo "environment=$NORMALIZED_ENV" >> $GITHUB_OUTPUT
+                  echo "requires-approval=$REQUIRES_APPROVAL" >> $GITHUB_OUTPUT
+                  echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+                  echo "🎯 Target Environment: $ENV → $NORMALIZED_ENV"
+                  echo "📦 Image Tag: $IMAGE_TAG"
+                  echo "🔐 Requires Approval: $REQUIRES_APPROVAL"
+
+    validate-production:
+        name: Validate Production Deployment
+        runs-on: ubuntu-latest
+        needs: setup
+        if: needs.setup.outputs.environment == 'production' && github.event_name == 'workflow_dispatch'
+        steps:
+            - name: Validate Production Confirmation
+              run: |
+                  if [ "${{ inputs.confirm_production }}" != "DEPLOY TO PRODUCTION" ]; then
+                    echo "❌ Production deployment confirmation required"
+                    echo "Please type exactly: DEPLOY TO PRODUCTION"
+                    exit 1
+                  fi
+                  echo "✅ Production deployment confirmed"
+
+    build-and-deploy:
+        name: Deploy Code to ${{ needs.setup.outputs.environment }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        needs: [setup, validate-production]
+        if: always() && needs.setup.result == 'success' && (needs.validate-production.result == 'success' || needs.validate-production.result == 'skipped')
+        environment:
+            name: ${{ needs.setup.outputs.requires-approval == 'true' && 'production' || needs.setup.outputs.environment }}
+
+        permissions:
+            id-token: write
+            contents: read
+            deployments: write
+
+        steps:
+            - name: Checkout Code
+              uses: actions/checkout@v4
+
+            - name: Configure AWS Credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                  role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+                  role-session-name: GitHubActions-Deploy-Code-${{ needs.setup.outputs.environment }}
+                  aws-region: us-east-1
+
+            - name: Fetch Application Secrets
+              id: app-secrets
+              uses: aws-actions/aws-secretsmanager-get-secrets@v2
+              with:
+                  secret-ids: |
+                      CONFIG_SECRET,v3-backend/${{ needs.setup.outputs.environment }}/config
+                  parse-json-secrets: true
+
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@v2
+
+            - name: Validate Docker Image Exists
+              run: |
+                  IMAGE_TAG="${{ needs.setup.outputs.image-tag }}"
+                  ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+                  IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+                  echo "🔍 Validating Docker image exists..."
+                  echo "📦 Image URI: $IMAGE_URI"
+                  echo "🏷️  Image Tag: $IMAGE_TAG"
+
+                  # Check if image exists in ECR
+                  if aws ecr describe-images \
+                    --repository-name $ECR_REPOSITORY \
+                    --image-ids imageTag=$IMAGE_TAG \
+                    --region us-east-1 > /dev/null 2>&1; then
+                    echo "✅ Image found: $IMAGE_URI"
+                  else
+                    echo "❌ Image not found: $IMAGE_URI"
+                    echo ""
+                    echo "Available images in repository:"
+                    aws ecr describe-images \
+                      --repository-name $ECR_REPOSITORY \
+                      --region us-east-1 \
+                      --query 'imageDetails[*].[imageTags[0], imageDigest, imagePushedAt]' \
+                      --output table || echo "No images found in repository"
+                    echo ""
+                    echo "💡 To build this image, run the 'Build Docker Image' workflow first"
+                    exit 1
+                  fi
+
+                  # Store image URI for use in deployment
+                  echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+                  echo "✅ Image validation completed successfully"
+
+            - name: Setup Node.js for Infrastructure Scripts
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '18'
+                  cache: 'npm'
+                  cache-dependency-path: infrastructure/package-lock.json
+
+            - name: Install Infrastructure Dependencies
+              run: |
+                  cd infrastructure
+                  npm ci --production=false
+
+            - name: Update ECS Services with Pre-built Image
+              run: |
+                  cd infrastructure
+                  echo "🚀 Deploying code to ${{ needs.setup.outputs.environment }}"
+                  echo "📦 Using pre-built image: $IMAGE_URI"
+                  echo "🏷️  Image tag: ${{ needs.setup.outputs.image-tag }}"
+
+                  # Map normalized environment to script name and environment parameter
+                  case "${{ needs.setup.outputs.environment }}" in
+                    "development")
+                      SCRIPT_ENV="dev"
+                      ENV_PARAM="development"
+                      ;;
+                    "staging")
+                      SCRIPT_ENV="staging"
+                      ENV_PARAM="staging"
+                      ;;
+                    "production")
+                      SCRIPT_ENV="prod"
+                      ENV_PARAM="production"
+                      ;;
+                    *)
+                      SCRIPT_ENV="${{ needs.setup.outputs.environment }}"
+                      ENV_PARAM="${{ needs.setup.outputs.environment }}"
+                      ;;
+                  esac
+
+                  echo "🔍 Using deployment script: deploy:${SCRIPT_ENV}:code-only"
+                  echo "🎯 Environment parameter: ${ENV_PARAM}"
+
+                  # Use existing sophisticated ECS update scripts
+                  DEPLOY_CMD="npm run deploy:${SCRIPT_ENV}:code-only -- \
+                    --environment \"${ENV_PARAM}\" \
+                    --image-uri \"$IMAGE_URI\" \
+                    --image-tag \"${{ needs.setup.outputs.image-tag }}\" \
+                    --deployment-id \"code-$(date +%Y%m%d-%H%M%S)-${{ github.run_number }}\""
+
+                  # Derive git SHA from image tag when possible for traceability
+                  DERIVED_GIT_SHA=$(echo "${{ needs.setup.outputs.image-tag }}" | grep -o '[a-f0-9]\{7,\}' | head -1 || true)
+                  if [ -n "$DERIVED_GIT_SHA" ]; then
+                    DEPLOY_CMD="$DEPLOY_CMD --git-sha \"$DERIVED_GIT_SHA\""
+                  fi
+
+                  # Attach workflow/context metadata
+                  DEPLOY_CMD="$DEPLOY_CMD --workflow-run-id \"${{ github.run_id }}\" --promoted-by \"${{ github.actor }}\""
+
+                  # Only add secrets parameter if CONFIG_SECRET is not empty
+                  if [ -n "${{ steps.app-secrets.outputs.CONFIG_SECRET }}" ]; then
+                    DEPLOY_CMD="$DEPLOY_CMD --secrets '${{ steps.app-secrets.outputs.CONFIG_SECRET }}'"
+                    echo "✅ Including application secrets in deployment"
+                  else
+                    echo "⚠️ No secrets found - deploying without secret updates"
+                  fi
+
+                  echo "🔍 Running command: $DEPLOY_CMD"
+                  eval "$DEPLOY_CMD"
+
+            - name: Wait for Deployment Stabilization
+              timeout-minutes: 10
+              run: |
+                  cd infrastructure
+                  echo "⏳ Waiting for deployment to fully stabilize..."
+
+                  # Map environment names to script names
+                  case "${{ needs.setup.outputs.environment }}" in
+                    "dev"|"development") SCRIPT_ENV="dev" ;;
+                    "staging"|"stage") SCRIPT_ENV="staging" ;;
+                    "prod"|"production") SCRIPT_ENV="prod" ;;
+                    *) SCRIPT_ENV="${{ needs.setup.outputs.environment }}" ;;
+                  esac
+
+                  echo "🎯 Using diagnostic script: diagnose:deployment:$SCRIPT_ENV"
+
+                  # Give the deployment time to settle
+                  echo "🕐 Initial wait for deployment transitions..."
+                  sleep 60
+
+                  # Use our diagnostic tool to check deployment status with enhanced error handling
+                  MAX_ATTEMPTS=20
+                  ATTEMPT=1
+
+                  while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+                    echo "🔍 Deployment check attempt $ATTEMPT/$MAX_ATTEMPTS..."
+                    
+                    # Run diagnostic tool with ignore-errors flag for better resilience in CI/CD
+                    DIAGNOSIS_OUTPUT=$(npm run diagnose:deployment:$SCRIPT_ENV -- --quiet --ignore-errors 2>&1)
+                    DIAGNOSIS_EXIT_CODE=$?
+                    
+                    echo "$DIAGNOSIS_OUTPUT"
+                    
+                    # Check for successful diagnosis execution first
+                    if [ $DIAGNOSIS_EXIT_CODE -eq 0 ]; then
+                      # Look for healthy services in the output
+                      if echo "$DIAGNOSIS_OUTPUT" | grep -q "🤖 SUMMARY: Healthy: 3"; then
+                        echo "✅ All services are healthy - deployment stabilized!"
+                        break
+                      elif echo "$DIAGNOSIS_OUTPUT" | grep -q "🤖 SUMMARY: Healthy: [2-3]"; then
+                        # At least 2 services healthy - likely acceptable
+                        HEALTHY_COUNT=$(echo "$DIAGNOSIS_OUTPUT" | grep "🤖 SUMMARY:" | grep -o "Healthy: [0-9]*" | grep -o "[0-9]*" || echo "0")
+                        echo "⚠️ Partial stability: $HEALTHY_COUNT/3 services healthy"
+                        if [ $HEALTHY_COUNT -ge 2 ]; then
+                          echo "✅ Sufficient services healthy - deployment considered stable!"
+                          break
+                        fi
+                      fi
+                    else
+                      echo "⚠️ Diagnosis script encountered issues (exit code: $DIAGNOSIS_EXIT_CODE) but continuing..."
+                      echo "This may indicate AWS API connectivity issues or permission problems"
+                    fi
+                    
+                    if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+                      echo "⏰ Deployment stabilization timeout reached"
+                      echo "🔍 Running final diagnostic check..."
+                      npm run diagnose:deployment:$SCRIPT_ENV -- --ignore-errors || echo "Final diagnosis failed, but proceeding..."
+                      echo "⚠️ Proceeding to health check despite stabilization timeout..."
+                      break
+                    fi
+                    
+                    echo "⏳ Waiting 30s before next check..."
+                    sleep 30
+                    ATTEMPT=$((ATTEMPT + 1))
+                  done
+
+            - name: Health Check and Validation
+              timeout-minutes: 5
+              run: |
+                  cd infrastructure
+                  echo "🏥 Running intelligent post-deployment health validation..."
+
+                  # Get environment-specific health URL
+                  case "${{ needs.setup.outputs.environment }}" in
+                    "dev"|"development")
+                      HEALTH_URL="https://dev-api.hyperchonk.com/health"
+                      ;;
+                    "staging")
+                      HEALTH_URL="https://staging-api.hyperchonk.com/health"
+                      ;;
+                    "production")
+                      HEALTH_URL="https://api.hyperchonk.com/health"
+                      ;;
+                    *)
+                      echo "❌ Unknown environment: ${{ needs.setup.outputs.environment }}"
+                      exit 1
+                      ;;
+                  esac
+
+                  # Map environment names to script names
+                  case "${{ needs.setup.outputs.environment }}" in
+                    "dev"|"development") SCRIPT_ENV="dev" ;;
+                    "staging"|"stage") SCRIPT_ENV="staging" ;;
+                    "prod"|"production") SCRIPT_ENV="prod" ;;
+                    *) SCRIPT_ENV="${{ needs.setup.outputs.environment }}" ;;
+                  esac
+
+                  echo "🎯 Using diagnostic script: diagnose:deployment:$SCRIPT_ENV"
+
+                  # Step 1: Run comprehensive diagnostic and capture detailed output
+                  echo "🔍 Step 1: Running comprehensive service diagnostics..."
+                  DIAGNOSIS_OUTPUT=$(npm run diagnose:deployment:$SCRIPT_ENV -- --quiet --ignore-errors 2>&1)
+                  DIAGNOSIS_EXIT_CODE=$?
+
+                  echo "$DIAGNOSIS_OUTPUT"
+
+                  # Extract health summary from diagnostic output
+                  HEALTHY_COUNT=$(echo "$DIAGNOSIS_OUTPUT" | grep "🤖 SUMMARY:" | grep -o "Healthy: [0-9]*" | grep -o "[0-9]*" || echo "0")
+                  DEGRADED_COUNT=$(echo "$DIAGNOSIS_OUTPUT" | grep "🤖 SUMMARY:" | grep -o "Degraded: [0-9]*" | grep -o "[0-9]*" || echo "0")
+                  FAILED_COUNT=$(echo "$DIAGNOSIS_OUTPUT" | grep "🤖 SUMMARY:" | grep -o "Failed: [0-9]*" | grep -o "[0-9]*" || echo "0")
+
+                  echo "📊 Diagnostic Summary: Healthy: $HEALTHY_COUNT, Degraded: $DEGRADED_COUNT, Failed: $FAILED_COUNT"
+
+                  # Step 2: Test endpoint functionality with retries
+                  echo "🌐 Step 2: Testing endpoint functionality..."
+                  ENDPOINT_HEALTHY=false
+                  MAX_ENDPOINT_ATTEMPTS=3
+
+                  for attempt in $(seq 1 $MAX_ENDPOINT_ATTEMPTS); do
+                    echo "🔗 Endpoint test attempt $attempt/$MAX_ENDPOINT_ATTEMPTS..."
+                    
+                    if ENDPOINT_RESPONSE=$(curl -s --max-time 10 "$HEALTH_URL" 2>/dev/null); then
+                      if echo "$ENDPOINT_RESPONSE" | grep -q '"status":"healthy"'; then
+                        echo "✅ Endpoint responding correctly"
+                        ENDPOINT_HEALTHY=true
+                        break
+                      else
+                        echo "⚠️ Endpoint responded but status is not healthy"
+                        echo "Response: $ENDPOINT_RESPONSE"
+                      fi
+                    else
+                      echo "❌ Endpoint request failed"
+                    fi
+                    
+                    if [ $attempt -lt $MAX_ENDPOINT_ATTEMPTS ]; then
+                      echo "⏳ Waiting 10s before retry..."
+                      sleep 10
+                    fi
+                  done
+
+                  # Step 3: Legacy health check for additional validation
+                  echo "🔧 Step 3: Running legacy health check for additional validation..."
+                  LEGACY_CHECK_PASSED=false
+                  if npm run check-status:$SCRIPT_ENV >/dev/null 2>&1; then
+                    echo "✅ Legacy health check passed"
+                    LEGACY_CHECK_PASSED=true
+                  else
+                    echo "⚠️ Legacy health check detected issues"
+                  fi
+
+                  # Step 4: Intelligent deployment validation logic
+                  echo "🧠 Step 4: Intelligent deployment validation..."
+
+                  # Primary success criteria: All services healthy OR endpoint working
+                  if [ "$HEALTHY_COUNT" = "3" ] && [ "$FAILED_COUNT" = "0" ]; then
+                    echo "🎉 DEPLOYMENT SUCCESS: All services are healthy"
+                    echo "✅ Diagnostic: All 3 services healthy"
+                    echo "✅ Endpoint: $([ "$ENDPOINT_HEALTHY" = true ] && echo "Working" || echo "Not tested")"
+                    echo "✅ Legacy check: $([ "$LEGACY_CHECK_PASSED" = true ] && echo "Passed" || echo "Not required")"
+                    
+                  elif [ "$ENDPOINT_HEALTHY" = true ] && [ "$HEALTHY_COUNT" -ge "1" ]; then
+                    echo "🎉 DEPLOYMENT SUCCESS: Endpoint functional with acceptable service health"
+                    echo "✅ Endpoint: Working correctly"
+                    echo "📊 Services: $HEALTHY_COUNT healthy, $DEGRADED_COUNT degraded, $FAILED_COUNT failed"
+                    echo "💡 Some services may be degraded but traffic is being served successfully"
+                    
+                    if [ "$DEGRADED_COUNT" -gt "0" ] || [ "$FAILED_COUNT" -gt "0" ]; then
+                      echo "⚠️ Note: Some services need attention, but deployment is functional"
+                      echo "🔍 Consider investigating degraded/failed services in CloudWatch logs"
+                    fi
+                    
+                  elif [ "$ENDPOINT_HEALTHY" = true ] && [ "$FAILED_COUNT" -lt "3" ]; then
+                    echo "🎯 DEPLOYMENT SUCCESS: Endpoint working despite partial service issues"
+                    echo "✅ Endpoint: Responding correctly"
+                    echo "📊 Services: $HEALTHY_COUNT healthy, $DEGRADED_COUNT degraded, $FAILED_COUNT failed"
+                    echo "🔄 This indicates old tasks are serving traffic while new tasks may have failed"
+                    echo "💡 Deployment is safe - traffic is being served, but investigate task failures"
+                    
+                  else
+                    echo "❌ DEPLOYMENT FAILURE: Critical issues detected"
+                    echo "🚨 Endpoint: $([ "$ENDPOINT_HEALTHY" = true ] && echo "Working" || echo "Not responding")"
+                    echo "📊 Services: $HEALTHY_COUNT healthy, $DEGRADED_COUNT degraded, $FAILED_COUNT failed"
+                    
+                    if [ "$ENDPOINT_HEALTHY" = false ]; then
+                      echo "🔥 Critical: Endpoint is not responding - this indicates total service failure"
+                    fi
+                    
+                    if [ "$FAILED_COUNT" = "3" ]; then
+                      echo "🔥 Critical: All services have failed"
+                    fi
+                    
+                    echo "🔍 Run detailed diagnostics: npm run diagnose:deployment:$SCRIPT_ENV"
+                    echo "🔄 Consider immediate rollback: npm run rollback:$SCRIPT_ENV"
+                    exit 1
+                  fi
+
+            - name: Validate Build Information
+              run: |
+                  echo "🔍 Validating deployed build information..."
+
+                  # Get environment-specific health URL
+                  case "${{ needs.setup.outputs.environment }}" in
+                    "dev"|"development")
+                      HEALTH_URL="https://dev-api.hyperchonk.com/health"
+                      ;;
+                    "staging")
+                      HEALTH_URL="https://staging-api.hyperchonk.com/health"
+                      ;;
+                    "production")
+                      HEALTH_URL="https://api.hyperchonk.com/health"
+                      ;;
+                    *)
+                      echo "❌ Unknown environment: ${{ needs.setup.outputs.environment }}"
+                      exit 1
+                      ;;
+                  esac
+
+                  echo "📡 Fetching health data from: $HEALTH_URL"
+
+                  # Fetch health endpoint
+                  HEALTH_RESPONSE=$(curl -s --max-time 10 "$HEALTH_URL")
+
+                  if [ $? -ne 0 ]; then
+                    echo "❌ Failed to fetch health endpoint"
+                    exit 1
+                  fi
+
+                  echo "📊 Health endpoint response:"
+                  echo "$HEALTH_RESPONSE" | jq '.' 2>/dev/null || echo "$HEALTH_RESPONSE"
+
+                  # Extract git hash from response
+                  DEPLOYED_HASH=$(echo "$HEALTH_RESPONSE" | jq -r '.build.gitCommit.shortHash // "unknown"' 2>/dev/null || echo "unknown")
+                  EXPECTED_HASH=$(echo "${{ needs.setup.outputs.image-tag }}" | grep -o '[a-f0-9]\{6,\}' | head -1)
+
+                  echo "📊 Deployed hash: $DEPLOYED_HASH"
+                  echo "📊 Expected hash: $EXPECTED_HASH"
+
+                  if [ "$DEPLOYED_HASH" != "unknown" ] && [ "$EXPECTED_HASH" != "" ] && [[ "$DEPLOYED_HASH" == "$EXPECTED_HASH"* ]]; then
+                    echo "✅ Build information validation passed"
+                  else
+                    echo "⚠️ Build information validation inconclusive (but deployment appears successful)"
+                    echo "This may be normal if the health endpoint doesn't include git hash information"
+                  fi
+
+            - name: Tag Production Image in ECR
+              if: needs.setup.outputs.environment == 'production' && success()
+              env:
+                  IMAGE_TAG: ${{ needs.setup.outputs.image-tag }}
+              run: |
+                  echo "🏷️ Tagging image for production tracking..."
+
+                  # Get the image manifest for the deployed image
+                  echo "📦 Fetching manifest for image tag: $IMAGE_TAG"
+                  MANIFEST=$(aws ecr batch-get-image \
+                    --repository-name $ECR_REPOSITORY \
+                    --image-ids imageTag=$IMAGE_TAG \
+                    --query 'images[0].imageManifest' \
+                    --output text)
+
+                  if [ -z "$MANIFEST" ]; then
+                    echo "❌ Failed to fetch image manifest for $IMAGE_TAG"
+                    exit 1
+                  fi
+
+                  # Before applying new prod-latest, check if there's a current one to preserve
+                  echo "🔍 Checking for current prod-latest image..."
+                  CURRENT_PROD_MANIFEST=$(aws ecr batch-get-image \
+                    --repository-name $ECR_REPOSITORY \
+                    --image-ids imageTag=prod-latest \
+                    --query 'images[0].imageManifest' \
+                    --output text 2>/dev/null || echo "")
+
+                  if [ -n "$CURRENT_PROD_MANIFEST" ]; then
+                    echo "📌 Found existing prod-latest, tagging it as prod-previous..."
+                    aws ecr put-image \
+                      --repository-name $ECR_REPOSITORY \
+                      --image-tag "prod-previous" \
+                      --image-manifest "$CURRENT_PROD_MANIFEST" || echo "⚠️ Failed to tag prod-previous"
+                  fi
+
+                  # Create production timestamp tag (permanent)
+                  PROD_DATE_TAG="prod-$(date +%Y%m%d-%H%M%S)"
+                  echo "🏷️ Adding production date tag: $PROD_DATE_TAG"
+                  aws ecr put-image \
+                    --repository-name $ECR_REPOSITORY \
+                    --image-tag "$PROD_DATE_TAG" \
+                    --image-manifest "$MANIFEST"
+
+                  # Update prod-latest tag (moves to new image)
+                  echo "🏷️ Updating prod-latest tag..."
+
+                  # Check if the image we're deploying is already tagged as prod-latest
+                  if [ -n "$CURRENT_PROD_MANIFEST" ] && [ "$CURRENT_PROD_MANIFEST" = "$MANIFEST" ]; then
+                    echo "ℹ️ Image is already tagged as prod-latest (same digest), skipping tag update"
+                  else
+                    aws ecr put-image \
+                      --repository-name $ECR_REPOSITORY \
+                      --image-tag "prod-latest" \
+                      --image-manifest "$MANIFEST"
+                    echo "✅ prod-latest tag updated successfully"
+                  fi
+
+                  # Store production tags for summary
+                  echo "PROD_DATE_TAG=$PROD_DATE_TAG" >> $GITHUB_ENV
+
+                  echo "✅ Production tags applied successfully:"
+                  echo "   - $PROD_DATE_TAG (permanent timestamp)"
+                  echo "   - prod-latest (current production)"
+                  echo "   - prod-previous (previous production)"
+                  echo "   Original tag: $IMAGE_TAG"
+
+            - name: Update Image Tag Parameter
+              run: |
+                  # Create/update SSM parameter with new image tag for tracking
+                  # This parameter is managed entirely by GitHub workflow to avoid CloudFormation conflicts
+                  aws ssm put-parameter \
+                    --name "/v3-backend/${{ needs.setup.outputs.environment }}/compute/currentImageTag" \
+                    --value "${{ needs.setup.outputs.image-tag }}" \
+                    --overwrite \
+                    --description "Current Docker image tag for ${{ needs.setup.outputs.environment }}" \
+                    --region us-east-1
+
+                  echo "📝 Updated SSM parameter with image tag: ${{ needs.setup.outputs.image-tag }}"
+
+            - name: Create Workflow Summary
+              if: always()
+              run: |
+                  ENVIRONMENT="${{ needs.setup.outputs.environment }}"
+                  IMAGE_TAG="${{ needs.setup.outputs.image-tag }}"
+                  DEPLOYMENT_ID="code-$(date +%Y%m%d-%H%M%S)-${{ github.run_number }}"
+                  DEPLOYMENT_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+                  # Determine deployment status
+                  if [ "${{ job.status }}" == "success" ]; then
+                    DEPLOYMENT_STATUS="✅ Deployment Successful"
+                    STATUS_EMOJI="🎉"
+                  else
+                    DEPLOYMENT_STATUS="❌ Deployment Failed"
+                    STATUS_EMOJI="⚠️"
+                  fi
+
+                  # Extract commit SHA from image tag if available
+                  COMMIT_SHA=$(echo "$IMAGE_TAG" | grep -o '[a-f0-9]\{6,\}' | head -1 || echo "unknown")
+
+                  # Get environment URL
+                  case "$ENVIRONMENT" in
+                    "dev"|"development")
+                      ENV_URL="https://dev-api.hyperchonk.com"
+                      ENV_COLOR="🟡"
+                      ;;
+                    "staging")
+                      ENV_URL="https://staging-api.hyperchonk.com"
+                      ENV_COLOR="🟠"
+                      ;;
+                    "production")
+                      ENV_URL="https://api.hyperchonk.com"
+                      ENV_COLOR="🔴"
+                      ;;
+                  esac
+
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+                  # $STATUS_EMOJI Deployment Summary
+
+                  ## 🎯 Deployment Target
+                  ### $ENV_COLOR Environment: \`$ENVIRONMENT\`
+                  ### 🐳 Docker Image Tag: \`$IMAGE_TAG\`
+
+                  ## 📊 Deployment Details
+                  | Field | Value |
+                  |-------|-------|
+                  | **Status** | $DEPLOYMENT_STATUS |
+                  | **Environment** | \`$ENVIRONMENT\` |
+                  | **Image Tag** | \`$IMAGE_TAG\` |
+                  | **Deployment ID** | \`$DEPLOYMENT_ID\` |
+                  | **Commit SHA** | \`$COMMIT_SHA\` |
+                  | **Deployed By** | ${{ github.actor }} |
+                  | **Deployment Time** | $DEPLOYMENT_TIME |
+                  | **Trigger** | Manual |
+                  EOF
+
+                  # Add production tags information if available
+                  if [ "$ENVIRONMENT" = "production" ] && [ -n "${PROD_DATE_TAG:-}" ]; then
+                    cat >> $GITHUB_STEP_SUMMARY << EOF
+                  | **Production Tags** | \`${PROD_DATE_TAG}\`, \`prod-latest\` |
+                  EOF
+                  fi
+
+                  cat >> $GITHUB_STEP_SUMMARY << EOF
+
+                  ## 🔗 Quick Links
+                  - [🌐 Environment URL]($ENV_URL)
+                  - [🏥 Health Check]($ENV_URL/health)
+                  - [📊 Swagger Documentation]($ENV_URL/docs)
+                  - [🔍 View Deployment Logs](https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups/log-group/$ENVIRONMENT-balancer-api)
+
+                  ## 🛠️ Useful Commands
+
+                  ### Monitor Deployment
+                  \`\`\`bash
+                  npm run monitor:$ENVIRONMENT
+                  \`\`\`
+
+                  ### View Logs
+                  \`\`\`bash
+                  npm run logs:$ENVIRONMENT:follow
+                  \`\`\`
+
+                  ### Check Status
+                  \`\`\`bash
+                  npm run check-status:$ENVIRONMENT
+                  \`\`\`
+
+                  ### Diagnose Issues
+                  \`\`\`bash
+                  npm run diagnose:deployment:$ENVIRONMENT
+                  \`\`\`
+                  EOF
+
+                  if [ "${{ job.status }}" != "success" ]; then
+                    cat >> $GITHUB_STEP_SUMMARY << EOF
+
+                  ## 🔄 Rollback Options
+                  1. **Quick rollback to previous image:**
+                     \`\`\`bash
+                     npm run rollback:$ENVIRONMENT
+                     \`\`\`
+
+                  2. **Deploy specific previous tag:**
+                     Use the [Deploy Code workflow](https://github.com/${{ github.repository }}/actions/workflows/deploy-code.yml) with a previous image tag
+
+                  3. **Check rollback candidates:**
+                     \`\`\`bash
+                     npm run diagnose-rollback:$ENVIRONMENT
+                     \`\`\`
+                  EOF
+                  fi
+
+            - name: Deployment Summary
+              if: success()
+              run: |
+                  # Map environment names to script names
+                  case "${{ needs.setup.outputs.environment }}" in
+                    "dev"|"development") SCRIPT_ENV="dev" ;;
+                    "staging"|"stage") SCRIPT_ENV="staging" ;;
+                    "prod"|"production") SCRIPT_ENV="prod" ;;
+                    *) SCRIPT_ENV="${{ needs.setup.outputs.environment }}" ;;
+                  esac
+
+                  echo "🎉 Code deployment completed successfully!"
+                  echo ""
+                  echo "📊 Deployment Summary:"
+                  echo "  Environment: ${{ needs.setup.outputs.environment }}"
+                  echo "  Image: $IMAGE_URI"
+                  echo "  Image Tag: ${{ needs.setup.outputs.image-tag }}"
+                  echo "  Deployment ID: code-$(date +%Y%m%d-%H%M%S)-${{ github.run_number }}"
+                  echo ""
+                  echo "🔗 Useful Commands:"
+                  echo "  Monitor: npm run monitor:$SCRIPT_ENV"
+                  echo "  Logs: npm run logs:$SCRIPT_ENV:follow"
+                  echo "  Status: npm run check-status:$SCRIPT_ENV"
+                  echo "  Diagnose: npm run diagnose:deployment:$SCRIPT_ENV"
+                  echo ""
+                  echo "💡 If you see deployment issues in the health check:"
+                  echo "  • Check CloudWatch logs for failed tasks"
+                  echo "  • Verify log group permissions and database connectivity"
+                  echo "  • Old tasks may still be serving traffic (safe deployment)"
+                  echo "  • New tasks failing doesn't always mean deployment failed"
+                  echo "  • Run 'npm run diagnose:deployment:$SCRIPT_ENV' for detailed analysis"
+
+            - name: Rollback Instructions
+              if: failure()
+              run: |
+                  # Map environment names to script names
+                  case "${{ needs.setup.outputs.environment }}" in
+                    "dev"|"development") SCRIPT_ENV="dev" ;;
+                    "staging"|"stage") SCRIPT_ENV="staging" ;;
+                    "prod"|"production") SCRIPT_ENV="prod" ;;
+                    *) SCRIPT_ENV="${{ needs.setup.outputs.environment }}" ;;
+                  esac
+
+                  echo "❌ Code deployment failed!"
+                  echo ""
+                  echo "🔄 Rollback Options:"
+                  echo "1. Quick rollback to previous image:"
+                  echo "   npm run rollback:$SCRIPT_ENV"
+                  echo ""
+                  echo "2. Deploy specific previous tag:"
+                  echo "   Use deploy-infra.yml workflow with a previous image tag"
+                  echo ""
+                  echo "3. Check current status:"
+                  echo "   npm run check-status:$SCRIPT_ENV"
+                  echo "   npm run diagnose-rollback:$SCRIPT_ENV"

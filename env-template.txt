@@ -1,0 +1,93 @@
+# Balancer v3 Backend - Local Development Environment Variables
+# Copy this file to .env and fill in your API keys
+
+# =============================================================================
+# API Keys (Required for full functionality)
+# =============================================================================
+
+# RPC Configuration (Template-based approach)
+# RPC_URL_TEMPLATE supports ${network} and ${apiKey} placeholders
+RPC_URL_TEMPLATE="https://$${network}-mainnet.g.alchemy.com/v2/$${apiKey}"
+RPC_API_KEY=
+
+# The Graph API Keys for subgraph access
+# Get one at: https://thegraph.com/studio/
+THEGRAPH_API_KEY_FANTOM=demo-key
+THEGRAPH_API_KEY_BALANCER=demo-key
+
+# CoinGecko API Key for price data (optional, has free tier)
+# Get one at: https://www.coingecko.com/en/api
+COINGECKO_API_KEY=
+
+# =============================================================================
+# Content Management
+# =============================================================================
+
+# Sanity API Token for content management
+# Get one at: https://sanity.io/
+SANITY_API_TOKEN=demo-token
+
+# =============================================================================
+# Monitoring & Error Tracking
+# =============================================================================
+
+# Sentry DSN for error tracking (optional)
+# Get one at: https://sentry.io/
+SENTRY_DSN=https://demo@demo.ingest.sentry.io/demo
+SENTRY_AUTH_TOKEN=demo-token
+SENTRY_TRACES_SAMPLE_RATE=0.1
+SENTRY_PROFILES_SAMPLE_RATE=0.1
+
+# =============================================================================
+# Database & Infrastructure (Auto-configured for local development)
+# =============================================================================
+
+# Database URL (auto-configured for Docker Compose)
+DATABASE_URL=postgresql://backend:let-me-in@localhost:5431/database?schema=public
+
+# AWS Configuration (auto-configured for LocalStack)
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=test
+AWS_SECRET_ACCESS_KEY=test
+AWS_ENDPOINT_URL=http://localhost:4566
+
+# Admin API Key for protected endpoints
+ADMIN_API_KEY=local-admin-key-123
+
+# =============================================================================
+# Application Configuration
+# =============================================================================
+
+# Application environment
+NODE_ENV=development
+DEPLOYMENT_ENV=local
+PORT=4000
+LOG_LEVEL=debug
+
+# Blockchain configuration
+DEFAULT_CHAIN_ID=250
+PROTOCOL=balancer
+WHITELISTED_CHAINS=1,10,137,250,42161,43114,8453,100
+
+# Service configuration flags (managed by Docker Compose)
+WORKER=false
+SCHEDULER=false
+AWS_ALERTS=false
+
+# =============================================================================
+# SQS Configuration (auto-configured for LocalStack)
+# =============================================================================
+
+SQS_BACKGROUND_JOB_QUEUE_URL=http://localhost:4566/000000000000/v3-backend-local-background-job-queue
+SQS_DATA_REFRESH_QUEUE_URL=http://localhost:4566/000000000000/v3-backend-local-data-refresh-queue
+SQS_NOTIFICATION_QUEUE_URL=http://localhost:4566/000000000000/v3-backend-local-notification-queue
+
+# =============================================================================
+# Health Check Configuration (optional tuning)
+# =============================================================================
+
+HEALTH_CHECK_HOST=localhost
+HEALTH_CHECK_PATH=/health
+HEALTH_CHECK_TIMEOUT=5000
+HEALTH_CHECK_RETRIES=3
+HEALTH_CHECK_RETRY_DELAY=1000 

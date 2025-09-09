@@ -1,0 +1,25 @@
+type DebugLogResult {
+    success: Boolean!
+    message: String!
+    timestamp: String!
+    logLevel: String!
+}
+
+extend type Query {
+    # Test log forwarding to Grafana Cloud with different log levels
+    debugTestLogs(
+        level: String = "info"
+        message: String = "Test log message"
+        includeMetadata: Boolean = true
+    ): DebugLogResult!
+
+    # Generate multiple test logs at once
+    debugBulkTestLogs(count: Int = 5, levels: [String!] = ["info", "warn", "error"]): [DebugLogResult!]!
+
+    # Test structured logging patterns
+    debugTestStructuredLogs(
+        jobName: String = "test-job"
+        chainId: String = "1"
+        simulateJobFlow: Boolean = true
+    ): [DebugLogResult!]!
+}

@@ -1,0 +1,41 @@
+extend type Query {
+    userGetPoolBalances(chains: [GqlChain!], address: String): [GqlUserPoolBalance!]!
+    userGetStaking(chains: [GqlChain!], address: String): [GqlPoolStaking!]!
+    """
+    Will de deprecated in favor of poolGetEvents
+    """
+    userGetPoolJoinExits(
+        first: Int = 10
+        skip: Int = 0
+        poolId: String!
+        chain: GqlChain
+        address: String
+    ): [GqlPoolJoinExit!]! @deprecated(reason: "Use poolEvents instead")
+    """
+    Will de deprecated in favor of poolGetEvents
+    """
+    userGetSwaps(first: Int = 10, skip: Int = 0, poolId: String!, chain: GqlChain, address: String): [GqlPoolSwap!]!
+        @deprecated(reason: "Use poolEvents instead")
+}
+
+extend type Mutation {
+    userSyncBalance(poolId: String!): String!
+    userSyncBalanceAllPools: String!
+
+    userInitWalletBalancesForAllPools(chain: GqlChain): String!
+    userInitWalletBalancesForPool(poolId: String!): String!
+    userSyncChangedWalletBalancesForAllPools: String!
+
+    userInitStakedBalances(stakingTypes: [GqlPoolStakingType!]!): String!
+    userSyncChangedStakedBalances: String!
+}
+
+type GqlUserPoolBalance {
+    poolId: String!
+    tokenAddress: String!
+    tokenPrice: Float!
+    totalBalance: AmountHumanReadable!
+    walletBalance: AmountHumanReadable!
+    stakedBalance: AmountHumanReadable!
+    chain: GqlChain!
+}

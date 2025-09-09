@@ -1,0 +1,111 @@
+fragment Factory on Factory {
+    id
+    type
+    version
+    pools {
+        id
+        address
+    }
+}
+
+fragment TypePool on Pool {
+    id
+    address
+    factory {
+        id
+        type
+        version
+    }
+    stableParams {
+        amp
+    }
+    stableSurgeParams {
+        amp
+    }
+    weightedParams {
+        weights
+    }
+    gyro2Params {
+        sqrtAlpha
+        sqrtBeta
+    }
+    gyroEParams {
+        alpha
+        beta
+        c
+        s
+        lambda
+        tauAlphaX
+        tauAlphaY
+        tauBetaX
+        tauBetaY
+        u
+        v
+        w
+        z
+        dSq
+    }
+    quantAMMWeightedParams {
+        oracleStalenessThreshold
+        poolRegistry
+        lambda
+        epsilonMax
+        absoluteWeightGuardRail
+        maxTradeSizeRatio
+        updateInterval
+        weightsAtLastUpdateInterval
+        weightBlockMultipliers
+        lastUpdateIntervalTime
+        lastInterpolationTimePossible
+        details {
+            id
+            category
+            name
+            type
+            value
+        }
+    }
+    lbpParams {
+        startTime
+        endTime
+        owner
+        isProjectTokenSwapInBlocked
+        reserveToken
+        reserveTokenStartWeight
+        reserveTokenEndWeight
+        projectToken
+        projectTokenStartWeight
+        projectTokenEndWeight
+    }
+    reClammParams {
+        lastTimestamp
+        lastVirtualBalances
+        dailyPriceShiftBase
+        centerednessMargin
+        currentFourthRootPriceRatio
+        startFourthRootPriceRatio
+        endFourthRootPriceRatio
+        priceRatioUpdateStartTime
+        priceRatioUpdateEndTime
+    }
+}
+
+query Pools(
+    $skip: Int
+    $first: Int
+    $orderBy: Pool_orderBy
+    $orderDirection: OrderDirection
+    $where: Pool_filter
+    $block: Block_height
+) {
+    pools(
+        skip: $skip
+        first: $first
+        orderBy: $orderBy
+        orderDirection: $orderDirection
+        where: $where
+        block: $block
+    ) {
+        ...TypePool
+    }
+}
